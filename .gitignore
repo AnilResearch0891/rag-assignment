@@ -1,0 +1,9 @@
+.venv/
+.cache/
+data/*.pdf
+outputs/*.csv
+outputs/*.json
+outputs/*.png
+notebooks/.ipynb_checkpoints/
+__pycache__/
+*.pyc

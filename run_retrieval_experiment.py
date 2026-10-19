@@ -1,0 +1,278 @@
+"""Run retrieval and re-ranking over NIST SP 800-63B-4.
+
+This script is the executable development version of the assignment notebook.
+It deliberately keeps answer generation separate from retrieval evidence so a
+rank shift is never confused with an LLM-quality claim.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from pypdf import PdfReader
+from sentence_transformers import CrossEncoder, SentenceTransformer
+
+
+ROOT = Path(__file__).resolve().parent
+PDF_PATH = ROOT / "data" / "NIST.SP.800-63B-4.pdf"
+OUTPUT_DIR = ROOT / "outputs"
+EXPECTED_SHA256 = "d9ab89576b5ae2cfb3ba37781110788dea27a85a5079496dbfc1a79834670afd"
+BI_ENCODER_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+CROSS_ENCODER_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CHUNK_WORDS = 180
+CHUNK_OVERLAP = 40
+SEED = 42
+
+
+@dataclass(frozen=True)
+class Chunk:
+    chunk_id: str
+    page_start: int
+    page_end: int
+    text: str
+
+
+CANDIDATE_QUERIES = [
+    "Must users change their passwords periodically?",
+    "Can email be used for out-of-band authentication?",
+    "Are syncable authenticators allowed at AAL3?",
+    "Can a remembered-browser cookie replace authentication?",
+    "What is the maximum number of consecutive failed authentication attempts before rate limiting is required?",
+    "When may an organization continue to use a restricted authenticator?",
+    "Are password composition rules such as requiring uppercase letters and symbols permitted?",
+    "Does generating a new out-of-band authentication secret reset the failed-attempt count?",
+    "Can knowledge-based authentication be used as an authenticator?",
+    "When is reauthentication required at AAL2?",
+    "May an authentication session fall back to an insecure transport protocol?",
+    "Are biometrics allowed as a single authentication factor?",
+    "Are users allowed to paste passwords from a password manager, or must they type them manually?",
+    "Should security questions such as a first pet be requested when a user creates a password?",
+    "After login, may an authenticated session downgrade its transport from HTTPS to HTTP?",
+    "Should account notifications be mailed to postal addresses by default, and what are the exceptions?",
+    "What happens when an activation PIN is entered incorrectly too many times, and how many attempts are allowed?",
+    "Can voice recognition be used for biometric authentication?",
+    "What should happen to a password when there is evidence it was compromised, even though scheduled password rotation is prohibited?",
+    "Can a password blocklist reject a password merely because it contains a dictionary word as a substring?",
+    "Which notification destination is ordinarily skipped but becomes mandatory for account recovery at AAL3?",
+    "If the only other notification address received an issued recovery code, must an account recovery notification also be sent by postal mail?",
+    "Can an AAL3 authenticator use a private key that is backed up through cloud synchronization?",
+    "May an activation PIN contain only numbers and be four characters long?",
+]
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def clean_page_text(text: str) -> str:
+    text = text.replace("\u00ad", "")
+    text = re.sub(r"(?<=\w)-\n(?=\w)", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def extract_pages(path: Path) -> list[tuple[int, str]]:
+    reader = PdfReader(path)
+    return [
+        (page_number, clean_page_text(page.extract_text() or ""))
+        for page_number, page in enumerate(reader.pages, start=1)
+    ]
+
+
+def chunk_pages(
+    pages: list[tuple[int, str]], chunk_words: int, overlap: int
+) -> list[Chunk]:
+    if not 0 <= overlap < chunk_words:
+        raise ValueError("overlap must satisfy 0 <= overlap < chunk_words")
+
+    words: list[tuple[str, int]] = []
+    for page_number, text in pages:
+        words.extend((word, page_number) for word in text.split())
+
+    chunks: list[Chunk] = []
+    step = chunk_words - overlap
+    for index, start in enumerate(range(0, len(words), step)):
+        window = words[start : start + chunk_words]
+        if len(window) < 40:
+            break
+        page_numbers = [page for _, page in window]
+        chunks.append(
+            Chunk(
+                chunk_id=f"C{index:04d}",
+                page_start=min(page_numbers),
+                page_end=max(page_numbers),
+                text=" ".join(word for word, _ in window),
+            )
+        )
+    return chunks
+
+
+def dense_top_k(
+    query: str,
+    model: SentenceTransformer,
+    corpus_embeddings: np.ndarray,
+    top_k: int = 10,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    started = time.perf_counter()
+    query_embedding = model.encode(
+        [query], normalize_embeddings=True, convert_to_numpy=True
+    )[0]
+    scores = corpus_embeddings @ query_embedding
+    indices = np.argsort(-scores)[:top_k]
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return indices, scores[indices], elapsed_ms
+
+
+def rerank(
+    query: str,
+    candidate_indices: np.ndarray,
+    chunks: list[Chunk],
+    model: CrossEncoder,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    started = time.perf_counter()
+    pairs = [(query, chunks[index].text) for index in candidate_indices]
+    scores = np.asarray(model.predict(pairs, show_progress_bar=False))
+    order = np.argsort(-scores)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return candidate_indices[order], scores[order], elapsed_ms
+
+
+def main() -> None:
+    np.random.seed(SEED)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    actual_hash = sha256(PDF_PATH)
+    if actual_hash != EXPECTED_SHA256:
+        raise RuntimeError(f"PDF checksum mismatch: {actual_hash}")
+
+    pages = extract_pages(PDF_PATH)
+    chunks = chunk_pages(pages, CHUNK_WORDS, CHUNK_OVERLAP)
+    print(f"Extracted {len(pages)} pages into {len(chunks)} chunks")
+
+    bi_encoder = SentenceTransformer(BI_ENCODER_NAME, device="cpu")
+    cross_encoder = CrossEncoder(CROSS_ENCODER_NAME, device="cpu")
+
+    embedding_started = time.perf_counter()
+    corpus_embeddings = bi_encoder.encode(
+        [chunk.text for chunk in chunks],
+        batch_size=32,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=True,
+    )
+    embedding_seconds = time.perf_counter() - embedding_started
+    print(f"Embedded corpus in {embedding_seconds:.2f} seconds")
+    np.save(OUTPUT_DIR / "corpus_embeddings.npy", corpus_embeddings)
+    (OUTPUT_DIR / "chunks.json").write_text(
+        json.dumps([asdict(chunk) for chunk in chunks], indent=2), encoding="utf-8"
+    )
+
+    rows: list[dict[str, object]] = []
+    top_chunks: dict[str, dict[str, list[dict[str, object]]]] = {}
+    for query_id, query in enumerate(CANDIDATE_QUERIES, start=1):
+        dense_indices, dense_scores, dense_ms = dense_top_k(
+            query, bi_encoder, corpus_embeddings
+        )
+        reranked_indices, cross_scores, rerank_ms = rerank(
+            query, dense_indices, chunks, cross_encoder
+        )
+        dense_rank = {int(index): rank for rank, index in enumerate(dense_indices, 1)}
+        cross_rank = {
+            int(index): rank for rank, index in enumerate(reranked_indices, 1)
+        }
+
+        for index in dense_indices:
+            index = int(index)
+            chunk = chunks[index]
+            rows.append(
+                {
+                    "query_id": f"Q{query_id:02d}",
+                    "query": query,
+                    "chunk_id": chunk.chunk_id,
+                    "pages": f"{chunk.page_start}-{chunk.page_end}",
+                    "dense_rank": dense_rank[index],
+                    "reranked_rank": cross_rank[index],
+                    "dense_score": float(dense_scores[dense_rank[index] - 1]),
+                    "cross_score": float(cross_scores[cross_rank[index] - 1]),
+                    "text": chunk.text,
+                }
+            )
+
+        def serialize(indices: np.ndarray, scores: np.ndarray) -> list[dict[str, object]]:
+            return [
+                {
+                    **asdict(chunks[int(index)]),
+                    "score": float(score),
+                }
+                for index, score in zip(indices[:3], scores[:3])
+            ]
+
+        top_chunks[f"Q{query_id:02d}"] = {
+            "query": query,
+            "baseline_top3": serialize(dense_indices, dense_scores),
+            "reranked_top3": serialize(reranked_indices, cross_scores),
+            "baseline_retrieval_ms": dense_ms,
+            "reranking_ms": rerank_ms,
+            "advanced_total_ms": dense_ms + rerank_ms,
+        }
+        print(
+            f"Q{query_id:02d}: dense={dense_ms:.1f} ms, "
+            f"rerank={rerank_ms:.1f} ms"
+        )
+
+    frame = pd.DataFrame(rows)
+    frame.to_csv(OUTPUT_DIR / "candidate_rank_shifts.csv", index=False)
+    (OUTPUT_DIR / "top_chunks.json").write_text(
+        json.dumps(top_chunks, indent=2), encoding="utf-8"
+    )
+    (OUTPUT_DIR / "run_metadata.json").write_text(
+        json.dumps(
+            {
+                "pdf_sha256": actual_hash,
+                "page_count": len(pages),
+                "chunk_count": len(chunks),
+                "chunk_words": CHUNK_WORDS,
+                "chunk_overlap": CHUNK_OVERLAP,
+                "bi_encoder": BI_ENCODER_NAME,
+                "cross_encoder": CROSS_ENCODER_NAME,
+                "embedding_seconds": embedding_seconds,
+                "seed": SEED,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    shifts = frame[
+        (frame["dense_rank"] > 3) & (frame["reranked_rank"] <= 3)
+    ].sort_values(["query_id", "reranked_rank"])
+    print("\nChunks promoted from dense ranks 4-10 into reranked Top 3:")
+    print(
+        shifts[
+            [
+                "query_id",
+                "chunk_id",
+                "pages",
+                "dense_rank",
+                "reranked_rank",
+                "text",
+            ]
+        ].to_string(index=False, max_colwidth=100)
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -42,13 +42,14 @@ The notebook records the PDF checksum, rank shifts, paired answers, and warmed C
         md(
             """## Environment
 
-Run from the `rag-assignment` directory. Uncomment the installation command in a fresh environment. The default `recorded` backend displays verified local outputs. Select `local` to regenerate them on CPU, or `gemini` after setting `GEMINI_API_KEY`."""
+Run from the `rag-assignment` directory. Uncomment the installation command in a fresh environment. The default `recorded` backend displays verified local outputs. Select `local` to regenerate them on CPU, or set `GENERATOR_BACKEND` and the API key in the ignored `.env` file for `gemini` / `openai`."""
         ),
         code(
-            """# %pip install -q pypdf sentence-transformers transformers torch pandas numpy matplotlib requests google-genai
+            """# %pip install -q pypdf sentence-transformers transformers torch pandas numpy matplotlib requests google-genai openai python-dotenv
 
 from pathlib import Path
 import json, os, statistics, sys, time
+from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -56,11 +57,12 @@ import pandas as pd
 ROOT = Path.cwd()
 if ROOT.name == "notebooks":
     ROOT = ROOT.parent
+load_dotenv(ROOT / ".env", override=False)
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HOME", str(ROOT / ".cache" / "huggingface"))
 
-GENERATOR_BACKEND = os.getenv("GENERATOR_BACKEND", "recorded")  # recorded | local | gemini
+GENERATOR_BACKEND = os.getenv("GENERATOR_BACKEND", "recorded")  # recorded | local | gemini | openai
 os.environ.setdefault("LOCAL_LLM_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
 LATENCY_REPEATS = 5"""
         ),
@@ -217,8 +219,21 @@ elif GENERATOR_BACKEND == "gemini":
     for run in runs:
         prompt1 = make_prompt(run["query"], [chunks[int(i)] for i in run["dense_i"][:3]])
         prompt2 = make_prompt(run["query"], [chunks[int(i)] for i in run["rerank_i"][:3]])
-        a1 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt1).text.strip()
-        a2 = client.models.generate_content(model="gemini-2.5-flash", contents=prompt2).text.strip()
+        a1 = client.models.generate_content(model="gemini-3.8-flash", contents=prompt1).text.strip()
+        a2 = client.models.generate_content(model="gemini-3.8-flash", contents=prompt2).text.strip()
+        answers[run["case"]] = {"answer1": a1, "answer2": a2}
+elif GENERATOR_BACKEND == "openai":
+    from openai import OpenAI
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Set OPENAI_API_KEY before using the OpenAI backend")
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    model_name = os.getenv("OPENAI_MODEL", "gpt-6-luna")
+    answers = {}
+    for run in runs:
+        prompt1 = make_prompt(run["query"], [chunks[int(i)] for i in run["dense_i"][:3]])
+        prompt2 = make_prompt(run["query"], [chunks[int(i)] for i in run["rerank_i"][:3]])
+        a1 = client.responses.create(model=model_name, input=prompt1).output_text.strip()
+        a2 = client.responses.create(model=model_name, input=prompt2).output_text.strip()
         answers[run["case"]] = {"answer1": a1, "answer2": a2}
 else:
     answers = RECORDED_LOCAL_ANSWERS
@@ -289,7 +304,10 @@ metadata = {
     "chunk_words": CHUNK_WORDS, "chunk_overlap": CHUNK_OVERLAP,
     "bi_encoder": BI_ENCODER_NAME, "cross_encoder": CROSS_ENCODER_NAME,
     "generator_backend": GENERATOR_BACKEND,
-    "local_generator": LOCAL_LLM_NAME, "index_seconds": index_seconds,
+    "local_generator": LOCAL_LLM_NAME,
+    "gemini_model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+    "openai_model": os.getenv("OPENAI_MODEL", "gpt-6-luna"),
+    "index_seconds": index_seconds,
 }
 (OUTPUT_DIR / "notebook_metadata.json").write_text(json.dumps(metadata, indent=2))
 metadata"""

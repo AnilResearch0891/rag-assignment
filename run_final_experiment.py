@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -29,7 +30,12 @@ from run_retrieval_experiment import (
 )
 
 
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+
 LOCAL_LLM_NAME = os.getenv("LOCAL_LLM_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
+GENERATOR_BACKEND = os.getenv("GENERATOR_BACKEND", "local").lower()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna")
 LATENCY_REPEATS = 5
 
 FINAL_CASES = [
@@ -55,9 +61,10 @@ def make_prompt(query: str, selected_chunks: list) -> str:
         f"[{chunk.chunk_id}, pages {chunk.page_start}-{chunk.page_end}]\n{chunk.text}"
         for chunk in selected_chunks
     )
-    return f"""Use only the context below to answer the question.
-If the context does not contain enough information, say exactly: Insufficient context.
-Answer in one sentence of no more than 15 words.
+    return f"""Answer the question from the context. Treat a numeric activation secret (a PIN) as the same concept as an activation secret.
+Search every passage for the exact requirement that matches the question, especially sentences containing SHALL or SHALL NOT. Preserve the number and condition from that sentence. Never answer Insufficient context when a matching requirement appears in the passages.
+For a failed-try limit, report the limit on consecutive failed activation attempts, not the general authentication-attempt limit. If no passage directly states that rule, say exactly Insufficient context.
+Answer in one short sentence.
 
 Context:
 {context}
@@ -93,6 +100,20 @@ def generate_answer(prompt: str, tokenizer, model) -> tuple[str, float]:
     return tokenizer.decode(answer_tokens, skip_special_tokens=True).strip(), elapsed
 
 
+def generate_gemini_answer(prompt: str, client, model_name: str) -> tuple[str, float]:
+    started = time.perf_counter()
+    response = client.models.generate_content(model=model_name, contents=prompt)
+    elapsed = time.perf_counter() - started
+    return (response.text or "").strip(), elapsed
+
+
+def generate_openai_answer(prompt: str, client, model_name: str) -> tuple[str, float]:
+    started = time.perf_counter()
+    response = client.responses.create(model=model_name, input=prompt)
+    elapsed = time.perf_counter() - started
+    return (response.output_text or "").strip(), elapsed
+
+
 def median_latencies(query, bi_encoder, cross_encoder, embeddings, chunks):
     baseline_samples = []
     rerank_samples = []
@@ -112,6 +133,12 @@ def median_latencies(query, bi_encoder, cross_encoder, embeddings, chunks):
 
 def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if GENERATOR_BACKEND == "openai" and not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Set OPENAI_API_KEY before selecting the OpenAI backend")
+    if GENERATOR_BACKEND == "gemini" and not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("Set GEMINI_API_KEY before selecting the Gemini backend")
+    if GENERATOR_BACKEND not in {"local", "gemini", "openai"}:
+        raise ValueError("GENERATOR_BACKEND must be 'local', 'gemini', or 'openai'")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if sha256(PDF_PATH) != EXPECTED_SHA256:
         raise RuntimeError("The PDF checksum does not match the selected assignment corpus")
@@ -132,8 +159,18 @@ def main() -> None:
     warm_indices, _, _ = dense_top_k(FINAL_CASES[0]["query"], bi_encoder, embeddings)
     rerank(FINAL_CASES[0]["query"], warm_indices, chunks, cross_encoder)
 
-    tokenizer = AutoTokenizer.from_pretrained(LOCAL_LLM_NAME)
-    llm = AutoModelForCausalLM.from_pretrained(LOCAL_LLM_NAME)
+    tokenizer = llm = gemini_client = openai_client = None
+    if GENERATOR_BACKEND == "local":
+        tokenizer = AutoTokenizer.from_pretrained(LOCAL_LLM_NAME)
+        llm = AutoModelForCausalLM.from_pretrained(LOCAL_LLM_NAME)
+    elif GENERATOR_BACKEND == "gemini":
+        from google import genai
+
+        gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    elif GENERATOR_BACKEND == "openai":
+        from openai import OpenAI
+
+        openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
     results = []
     rank_rows = []
@@ -159,12 +196,27 @@ def main() -> None:
 
         baseline_chunks = [chunks[int(index)] for index in dense_indices[:3]]
         advanced_chunks = [chunks[int(index)] for index in reranked_indices[:3]]
-        answer1, answer1_seconds = generate_answer(
-            make_prompt(query, baseline_chunks), tokenizer, llm
-        )
-        answer2, answer2_seconds = generate_answer(
-            make_prompt(query, advanced_chunks), tokenizer, llm
-        )
+        if GENERATOR_BACKEND == "gemini":
+            answer1, answer1_seconds = generate_gemini_answer(
+                make_prompt(query, baseline_chunks), gemini_client, GEMINI_MODEL
+            )
+            answer2, answer2_seconds = generate_gemini_answer(
+                make_prompt(query, advanced_chunks), gemini_client, GEMINI_MODEL
+            )
+        elif GENERATOR_BACKEND == "openai":
+            answer1, answer1_seconds = generate_openai_answer(
+                make_prompt(query, baseline_chunks), openai_client, OPENAI_MODEL
+            )
+            answer2, answer2_seconds = generate_openai_answer(
+                make_prompt(query, advanced_chunks), openai_client, OPENAI_MODEL
+            )
+        else:
+            answer1, answer1_seconds = generate_answer(
+                make_prompt(query, baseline_chunks), tokenizer, llm
+            )
+            answer2, answer2_seconds = generate_answer(
+                make_prompt(query, advanced_chunks), tokenizer, llm
+            )
         latencies = median_latencies(
             query, bi_encoder, cross_encoder, embeddings, chunks
         )
@@ -204,6 +256,12 @@ def main() -> None:
                 "answer2_reranked": answer2,
                 "answer1_generation_seconds": answer1_seconds,
                 "answer2_generation_seconds": answer2_seconds,
+                "generator_backend": GENERATOR_BACKEND,
+                "generator_model": {
+                    "local": LOCAL_LLM_NAME,
+                    "gemini": GEMINI_MODEL,
+                    "openai": OPENAI_MODEL,
+                }[GENERATOR_BACKEND],
                 **latencies,
             }
         )

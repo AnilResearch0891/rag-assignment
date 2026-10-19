@@ -13,18 +13,20 @@ dense Top-10, profiles latency, and exports report-ready evidence.
 
 ```bash
 cd rag-assignment
-python -m venv .venv
-.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0
-.venv/bin/pip install -r requirements.txt
+python3.11 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
 mkdir -p data
 curl -L --fail \
   https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-63B-4.pdf \
   -o data/NIST.SP.800-63B-4.pdf
-sha256sum data/NIST.SP.800-63B-4.pdf
+shasum -a 256 data/NIST.SP.800-63B-4.pdf
 ```
 
-The separate CPU PyTorch installation avoids downloading CUDA libraries on a
-machine without a GPU.
+Use Python 3.11 for this environment. The pinned NumPy 2.2.6 requires Python
+3.10 or newer. The standard
+PyTorch package installed from PyPI uses CPU on macOS unless supported Apple
+GPU acceleration is selected automatically.
 
 The expected PDF SHA-256 is
 `d9ab89576b5ae2cfb3ba37781110788dea27a85a5079496dbfc1a79834670afd`.
@@ -42,9 +44,37 @@ export LOCAL_LLM_NAME=Qwen/Qwen2.5-1.5B-Instruct
 
 Other `AutoModelForCausalLM` models can be substituted in the same way. Larger
 models generally follow retrieved evidence better but require more memory and
-CPU/GPU time. The notebook also supports `GENERATOR_BACKEND=gemini` with a
-`GEMINI_API_KEY` supplied through the environment. Never store API keys in the
+CPU/GPU time. The notebook and final experiment script support Gemini and
+OpenAI API generation. Keep API keys in environment variables, never in the
 notebook or repository.
+
+For Gemini, use `GENERATOR_BACKEND=gemini` and `GEMINI_API_KEY`. For OpenAI,
+use `GENERATOR_BACKEND=openai` and `OPENAI_API_KEY`. The OpenAI model defaults
+to `gpt-6-luna`; override it with `OPENAI_MODEL` if needed. For example:
+
+```bash
+export GENERATOR_BACKEND=gemini
+export GEMINI_API_KEY="your-key"
+.venv/bin/python run_final_experiment.py
+```
+
+For OpenAI, change the backend and supply the OpenAI API key in your shell.
+Then run:
+
+```bash
+export GENERATOR_BACKEND=openai
+export OPENAI_API_KEY="your-key"
+OPENAI_MODEL=gpt-6-luna .venv/bin/python run_final_experiment.py
+```
+
+The key is read only from the environment. The runner uses `gemini-3.8-flash`
+by default when using Gemini; set `GEMINI_MODEL` to choose another compatible
+model.
+
+To let the runner load a local API key without putting it in shell history,
+copy `.env.example` to `.env`, replace the placeholder with your Gemini key,
+and keep the file private. `.env` is ignored by Git. The final runner loads
+this file automatically.
 
 ## Reproducibility boundary
 

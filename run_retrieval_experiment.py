@@ -129,7 +129,15 @@ def dense_top_k(
     query_embedding = model.encode(
         [query], normalize_embeddings=True, convert_to_numpy=True
     )[0]
-    scores = corpus_embeddings @ query_embedding
+    # A small float64 reduction avoids spurious Accelerate/BLAS overflow
+    # warnings seen with float32 matmul on some macOS Python builds.
+    scores = np.sum(
+        np.asarray(corpus_embeddings, dtype=np.float64)
+        * np.asarray(query_embedding, dtype=np.float64),
+        axis=1,
+    )
+    if not np.isfinite(scores).all():
+        raise RuntimeError("Dense retrieval produced non-finite similarity scores")
     indices = np.argsort(-scores)[:top_k]
     elapsed_ms = (time.perf_counter() - started) * 1000
     return indices, scores[indices], elapsed_ms

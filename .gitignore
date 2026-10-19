@@ -1,4 +1,5 @@
 .venv/
+.env
 .cache/
 data/*.pdf
 outputs/*.csv

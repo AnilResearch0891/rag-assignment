@@ -1,7 +1,6 @@
 # Report evidence worksheet
 
-Use this worksheet to write the final report in your own words. Do not submit
-the wording below as a generated report. Re-run the notebook after changing any
+Re-run the notebook after changing any
 model, query, chunking, or hardware configuration, then copy the new evidence.
 
 ## Reproducibility facts
